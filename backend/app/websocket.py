@@ -26,10 +26,6 @@ def generate_chunk(stream) -> bytes:
                 chunk_bytes = chunk.get("bytes")
                 yield chunk_bytes
 
-def chunk_data(data, chunk_size):
-    for i in range(0, len(data), chunk_size):
-        yield data[i:i + chunk_size]
-
 
 def handler(event, context):
     print(f"Received event: {event}")
@@ -69,53 +65,50 @@ def handler(event, context):
             return {"statusCode": 404, "body": f"bot {chat_input.bot_id} not found."}
         else:
             return {"statusCode": 400, "body": "Invalid request."}
-        
     payload = get_invoke_payload(conversation, chat_input)
+
     try:
-        # Invoke bedrock streaming api with chunked data
-        for chunked_payload in chunk_data(payload, 1000):  # Adjust chunk size as needed
-            response = client.invoke_model_with_response_stream(
-                body=chunked_payload["body"],
-                modelId=chunked_payload["model_id"],
-                accept=chunked_payload["accept"],
-                contentType=chunked_payload["content_type"],
-            )
-
-            # Process and send chunks of streaming data
-            stream = response.get("body")
-            completions = []
-            for chunk in generate_chunk(stream):
-                chunk_data = json.loads(chunk.decode("utf-8"))
-                completions.append(chunk_data["completion"])
-                if "stop_reason" in chunk_data and chunk_data["stop_reason"] is not None:
-                    # Persist conversation before finish streaming so that front-end can avoid 404 issue
-                    concatenated = "".join(completions)
-                    # Append entire completion as the last message
-                    assistant_msg_id = str(ULID())
-                    message = MessageModel(
-                        role="assistant",
-                        content=ContentModel(content_type="text", body=concatenated),
-                        model=chat_input.message.model,
-                        children=[],
-                        parent=user_msg_id,
-                        create_time=get_current_time(),
-                    )
-                    conversation.message_map[assistant_msg_id] = message
-                    # Append children to parent
-                    conversation.message_map[user_msg_id].children.append(assistant_msg_id)
-                    conversation.last_message_id = assistant_msg_id
-
-                    store_conversation(user_id, conversation)
-                try:
-                    # Send completion
-                    gatewayapi.post_to_connection(ConnectionId=connection_id, Data=chunk)
-                except Exception as e:
-                    print(f"Failed to post message: {str(e)}")
-                    return {"statusCode": 500, "body": "Failed to send message to connection."}
-
+        # Invoke bedrock streaming api
+        response = client.invoke_model_with_response_stream(
+            body=payload["body"],
+            modelId=payload["model_id"],
+            accept=payload["accept"],
+            contentType=payload["content_type"],
+        )
     except Exception as e:
         print(f"Failed to invoke bedrock: {e}")
         return {"statusCode": 500, "body": "Failed to invoke bedrock."}
+
+    stream = response.get("body")
+    completions = []
+    for chunk in generate_chunk(stream):
+        chunk_data = json.loads(chunk.decode("utf-8"))
+        completions.append(chunk_data["completion"])
+        if "stop_reason" in chunk_data and chunk_data["stop_reason"] is not None:
+            # Persist conversation before finish streaming so that front-end can avoid 404 issue
+            concatenated = "".join(completions)
+            # Append entire completion as the last message
+            assistant_msg_id = str(ULID())
+            message = MessageModel(
+                role="assistant",
+                content=ContentModel(content_type="text", body=concatenated),
+                model=chat_input.message.model,
+                children=[],
+                parent=user_msg_id,
+                create_time=get_current_time(),
+            )
+            conversation.message_map[assistant_msg_id] = message
+            # Append children to parent
+            conversation.message_map[user_msg_id].children.append(assistant_msg_id)
+            conversation.last_message_id = assistant_msg_id
+
+            store_conversation(user_id, conversation)
+        try:
+            # Send completion
+            gatewayapi.post_to_connection(ConnectionId=connection_id, Data=chunk)
+        except Exception as e:
+            print(f"Failed to post message: {str(e)}")
+            return {"statusCode": 500, "body": "Failed to send message to connection."}
 
     # Update bot last used time
     if chat_input.bot_id:
